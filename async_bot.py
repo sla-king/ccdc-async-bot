@@ -564,4 +564,4 @@ async def reopen_team(interaction: discord.Interaction, team_num: int):
 
 
 # Run the bot
-bot.run("[REDACTED_TOKEN]")
+bot.run("TOKEN HERE")
