@@ -21,6 +21,13 @@ intents.dm_messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+async def block_dms_globally(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command can only be used inside a server channel.", ephemeral=True)
+        return False
+    return True
+bot.tree.interaction_check = block_dms_globally
+
 # Base directory for all bot data
 DATA_DIR = pathlib.Path("bot_data")
 
