@@ -270,30 +270,42 @@ class Clone(CLI):
 
     def _clone_training(self) -> None:
         """Clone training environment with multiple copies across nodes"""
+        import re
+        
         if not self.environment:
             raise ValidationError("Environment configuration not loaded for training mode")
-        
+            
         try:
-            copies = int(self.environment.env["copies"])
             vmid = int(self.environment.env["vmid_start"])
             size = len(self.environment.boxes)
-
-            router_ip = self.environment.env["router_ip"]
             gw = self.environment.env["gw"]
             bridge = self.environment.env["bridge"]
             vlan = int(self.environment.env["vlan_start"])
+            
+            raw_router_ip = self.environment.env["router_ip"]
+            ip_index = 1
+            copies = int(self.environment.env.get("copies", 1))
+            
+            match = re.search(r'\[(\d+)-(\d+)\]', raw_router_ip)
+            if match:
+                ip_index = int(match.group(1))
+                copies = (int(match.group(2)) - ip_index) + 1  
+                router_ip = re.sub(r'\[\d+-\d+\]', 'X', raw_router_ip)
+            else:
+                router_ip = raw_router_ip
+            
             router = None
             clone_count = 0
             
             # Show confirmation dialog
             vlan_end = vlan + math.ceil(copies / len(self.environment.nodes)) - 1
-            router_end = router_ip.replace('X', str(copies))
+            router_end = router_ip.replace('X', str(ip_index + copies - 1))
             
             self.logger.info(
                 f"Planning to clone {copies} copies of environment starting from VMID {vmid} to {vmid + size * copies - 1}"
             )
             self.logger.info(f"Will use bridge {bridge}, vlan tags {vlan} to {vlan_end} across nodes {', '.join(self.environment.nodes)}")
-            self.logger.info(f"Router IPs will span {router_ip.replace('X', '1')} to {router_end}")
+            self.logger.info(f"Router IPs will span {router_ip.replace('X', str(ip_index))} to {router_end}")
             
             confirm = input("Continue? (Y/N): ")
             if confirm.upper() != 'Y':
@@ -310,7 +322,7 @@ class Clone(CLI):
                         break
                 except Exception:
                     continue
-            
+                    
             self.logger.info(f"Starting training cloning: {copies} copies across {len(self.environment.nodes)} nodes")
             
             while clone_count < copies:
@@ -330,12 +342,12 @@ class Clone(CLI):
                             
                             # Configure networking
                             if router == box.id:
-                                # This is the router VM
+                                # This is the router VM 
                                 cloudinit.set_cloudinit(
                                     self.prox,
                                     node,
                                     vmid,
-                                    ipconfig0=f"ip={router_ip.replace('X', str(clone_count + 1))},gw={gw}",
+                                    ipconfig0=f"ip={router_ip.replace('X', str(ip_index))},gw={gw}",
                                     net1=f"model=virtio,bridge={bridge},tag={vlan}",
                                 )
                             else:
@@ -344,7 +356,6 @@ class Clone(CLI):
                                 model = "virtio"  # Default
                                 if net_config:
                                     model = net_config.split(",")[0].split("=")[0] if "=" in net_config.split(",")[0] else "virtio"
-
                                 cloudinit.set_cloudinit(
                                     self.prox,
                                     node,
@@ -362,19 +373,19 @@ class Clone(CLI):
                         except Exception as e:
                             self.logger.error(f"Failed to clone box {box.id}: {e}")
                             raise
-                    
-                    clone_count += 1
-                    if clone_count >= copies:
-                        break
+                            
+                clone_count += 1
+                ip_index += 1  # INCREMENT IP INDEX
+                if clone_count >= copies:
+                    break
                 vlan += 1
-            
+                
             self.logger.info("Training cloning completed successfully")
         except KeyError as e:
             raise ValidationError(f"Missing required environment configuration: {e}")
         except Exception as e:
             self.logger.error(f"Training cloning failed: {e}")
             raise CloneError(f"Training cloning failed: {e}")
-
 
 def main(args=None):
     Clone.cli_executor(args)

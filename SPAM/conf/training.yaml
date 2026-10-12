@@ -1,12 +1,11 @@
 env:
     nodes:
       - cuci-pve-02
-    copies: 10
-    vmid_start: 26121
-    router_ip: 10.100.3X.2/18
+    vmid_start: 26141
+    router_ip: 10.100.3[5-9].2/18
     bridge: vmbr3
     gw: 10.100.0.1
-    vlan_start: 2601
+    vlan_start: 2605
     boxes:
     - id: '26110'
     - id: '26111'
