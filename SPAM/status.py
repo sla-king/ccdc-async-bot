@@ -51,6 +51,11 @@ class Status(CLI):
             action='store_true',
             help='Shutdown the VMs.'
         )
+        self.parser.add_argument(
+            '--revert',
+            action='store_true',
+            help='Revert VMs to their root (parent-less) snapshot.'
+        )
 
     def post_process_args(self, options):
         """Post-process and validate arguments"""
@@ -66,11 +71,11 @@ class Status(CLI):
             raise ValidationError("The 'vmid' argument is required unless -r or --crossnode is set")
         
         # Validate that at least one operation is specified
-        if not any([options.start, options.stop, options.destroy, options.shutdown]):
-            raise ValidationError("Must specify an operation: --start, --stop, or --destroy")
+        if not any([options.start, options.stop, options.destroy, options.shutdown, options.revert]):
+            raise ValidationError("Must specify an operation: --start, --stop, --destroy, or --revert")
         
         # Validate mutually exclusive operations
-        operations = sum([bool(options.start), bool(options.stop), bool(options.destroy)])
+        operations = sum([bool(options.start), bool(options.stop), bool(options.destroy), bool(options.revert)])
         if operations > 1:
             raise ValidationError("Only one operation can be specified at a time")
         
@@ -114,6 +119,8 @@ class Status(CLI):
             func = self._destroy_vm
         elif self.options.shutdown:
             func = self._shutdown_vm
+        elif self.options.revert:
+            func = self._revert_vm
         
         try:
             if self.options.vmid:
@@ -204,6 +211,46 @@ class Status(CLI):
             self.logger.error(f"Failed to destroy VM {vmid} on node {node}: {e}")
             raise ProxmoxAPIError(f"Failed to destroy VM {vmid}: {e}")
     
+    def _revert_vm(self, node: str, vmid: int) -> None:
+        """Revert VM to its most recent snapshot"""
+        try:
+            node = validate_node_name(node)
+            vmid = validate_vmid(vmid)
+            
+            self.logger.info(f"Reverting VM {vmid} on node {node} to most recent snapshot")
+            
+            # Stop the VM first
+            try:
+                self._stop_vm(node, vmid)
+            except ProxmoxAPIError:
+                self.logger.warning(f"Could not stop VM {vmid}, attempting revert anyway")
+            
+            # Get all snapshots and find the most recent one
+            snaps = self.prox.nodes(node).qemu(vmid).snapshot.get()
+            latest_snapname = None
+            max_time = -1
+            
+            for snap in snaps:
+                name = snap.get("name")
+                # Ignore the virtual "current" state Proxmox returns in the list
+                if name and name != "current":
+                    snaptime = int(snap.get("snaptime", 0))
+                    if snaptime > max_time:
+                        max_time = snaptime
+                        latest_snapname = name
+                        
+            if latest_snapname is None:
+                raise ProxmoxAPIError(f"No valid snapshots found for VM {vmid}")
+            
+            # Rollback and wait
+            task_id = self.prox.nodes(node).qemu(vmid).snapshot(latest_snapname).rollback.post()
+            utils.block_until_done(self.prox, task_id, node)
+            self.logger.info(f"Successfully reverted VM {vmid} on node {node} to snapshot '{latest_snapname}'")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to revert VM {vmid} on node {node}: {e}")
+            raise ProxmoxAPIError(f"Failed to revert VM {vmid}: {e}")
+
     def _apply_crossnode(self, func: Callable) -> None:
         """Apply operation across multiple nodes for training environments"""
         if not self.environment:
