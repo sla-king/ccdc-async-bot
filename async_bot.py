@@ -611,26 +611,30 @@ async def create_team(interaction: discord.Interaction):
     
     team.members[user_id] = interaction.user.name
     
+    # Replace the loading indicator with a visible status message
+    await interaction.edit_original_response(content=f"Starting machines for Team {team_num}, please wait...")
+
+    # Run revert + start subprocesses before notifying the user
+    await run_network_setup(interaction.guild_id, team_num)
+
+    # Machines are ready — now send the DM
     timer_embed = await create_timer_embed(team)
     dm_sent, channel_id, msg_id = await send_dm(user_id, embed=timer_embed)
     
     if not dm_sent:
-        await interaction.followup.send("I couldn't DM you! Please enable DMs from server members and try again.", ephemeral=True)
         del manager.teams[team_num]
         del manager.user_teams[user_id]
         manager.available_team_nums.add(team_num)
+        await interaction.edit_original_response(content="I couldn't DM you! Please enable DMs from server members and try again.")
         return
     
     if channel_id and msg_id:
         team.timer_message_ids[user_id] = (channel_id, msg_id)
 
-    # Run revert + start subprocesses now that the team has claimed its network slot
-    await run_network_setup(interaction.guild_id, team_num)
-
     # Save state after team creation
     manager.save_teams()
 
-    await interaction.followup.send(f"Team {team_num} created! Check your DMs for details.", ephemeral=True)
+    await interaction.edit_original_response(content=f"Team {team_num} is ready! Check your DMs for details.")
 
 class JoinRequestView(discord.ui.View):
     def __init__(self, user_id: int, username: str, team_num: int, guild_id: int):
