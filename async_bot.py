@@ -3,8 +3,9 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import asyncio
 from typing import Optional, Dict, List, Set
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
+import re
 import os
 from dotenv import load_dotenv
 
@@ -51,34 +52,54 @@ def get_guild_data_dir(guild_id: int) -> pathlib.Path:
 class TeamSettings:
     def __init__(self):
         self.max_team_size = 0
-        self.max_teams = 0
         self.duration_minutes = 0
-        self.ip_base = "10.10.x.10"
+        self.ip_range = ""          # e.g. "10.100.[41-45].0/24"
         self.start_vmid = 0
         self.number_of_machines = 0
         self.bot_enabled = True
-    
+
+    def parse_ip_range(self):
+        """Parse ip_range and return (template, range_start, range_end), or None if invalid."""
+        match = re.search(r'\[(\d+)-(\d+)\]', self.ip_range)
+        if not match:
+            return None
+        return self.ip_range, int(match.group(1)), int(match.group(2))
+
+    @property
+    def max_teams(self) -> int:
+        """Derive max_teams automatically from the bracket range in ip_range."""
+        result = self.parse_ip_range()
+        if result is None:
+            return 0
+        _, start, end = result
+        return max(0, end - start + 1)
+
     def get_ip(self, team_num: int) -> str:
-        return self.ip_base.replace("x", str(team_num))
-    
+        """Return the resolved subnet string for a 1-indexed team number."""
+        result = self.parse_ip_range()
+        if result is None:
+            return "Not configured"
+        template, start, _ = result
+        value = start + team_num - 1
+        return re.sub(r'\[\d+-\d+\]', str(value), template)
+
     def to_dict(self) -> dict:
         return {
             "max_team_size": self.max_team_size,
-            "max_teams": self.max_teams,
             "duration_minutes": self.duration_minutes,
-            "ip_base": self.ip_base,
+            "ip_range": self.ip_range,
             "start_vmid": self.start_vmid,
             "number_of_machines": self.number_of_machines,
             "bot_enabled": self.bot_enabled
         }
-    
+
     @classmethod
     def from_dict(cls, data: dict):
         settings = cls()
         settings.max_team_size = data.get("max_team_size", 0)
-        settings.max_teams = data.get("max_teams", 0)
         settings.duration_minutes = data.get("duration_minutes", 0)
-        settings.ip_base = data.get("ip_base", "10.10.x.10")
+        # Support legacy "ip_base" field from older save files
+        settings.ip_range = data.get("ip_range", data.get("ip_base", ""))
         settings.start_vmid = data.get("start_vmid", 0)
         settings.number_of_machines = data.get("number_of_machines", 0)
         settings.bot_enabled = data.get("bot_enabled", True)
@@ -90,7 +111,7 @@ class Team:
         self.captain_id = captain_id
         self.members: Dict[int, str] = {captain_id: ""}
         self.settings = settings
-        self.created_at = datetime.now()
+        self.created_at = datetime.now(timezone.utc)
         self.end_time = self.created_at + timedelta(minutes=settings.duration_minutes)
         self.is_active = True
         self.timer_message_ids: Dict[int, tuple] = {}
@@ -115,8 +136,8 @@ class Team:
         team.captain_id = data["captain_id"]
         team.members = {int(k): v for k, v in data["members"].items()}
         team.settings = settings
-        team.created_at = datetime.fromisoformat(data["created_at"])
-        team.end_time = datetime.fromisoformat(data["end_time"])
+        team.created_at = datetime.fromisoformat(data["created_at"]).replace(tzinfo=timezone.utc) if datetime.fromisoformat(data["created_at"]).tzinfo is None else datetime.fromisoformat(data["created_at"])
+        team.end_time = datetime.fromisoformat(data["end_time"]).replace(tzinfo=timezone.utc) if datetime.fromisoformat(data["end_time"]).tzinfo is None else datetime.fromisoformat(data["end_time"])
         team.is_active = data["is_active"]
         team.timer_message_ids = {int(k): tuple(v) for k, v in data.get("timer_message_ids", {}).items()}
         team.halfway_notified = data.get("halfway_notified", False)
@@ -133,15 +154,11 @@ class GuildTeamManager:
         self.admins: Set[int] = set()
         self.closed_teams: Set[int] = set()
     
-    def update_max_teams(self, new_max: int):
-        old_max = self.settings.max_teams
-        self.settings.max_teams = new_max
-        
-        if new_max > old_max:
-            for team_num in range(old_max + 1, new_max + 1):
-                self.available_team_nums.add(team_num)
-        
-        self.save_settings()
+    def recalculate_available_teams(self):
+        """Recalculate available team slots from ip_range, preserving active and closed teams."""
+        new_max = self.settings.max_teams
+        occupied = set(self.teams.keys()) | self.closed_teams
+        self.available_team_nums = {n for n in range(1, new_max + 1) if n not in occupied}
     
     def get_settings_file(self) -> pathlib.Path:
         return get_guild_data_dir(self.guild_id) / "settings.json"
@@ -286,6 +303,11 @@ async def send_dm(user_id: int, content: str = None, embed: discord.Embed = None
         msg = await user.send(content=content, embed=embed, view=view)
         return True, msg.channel.id, msg.id
     except discord.Forbidden:
+        # User has DMs disabled or has blocked the bot
+        return False, None, None
+    except discord.HTTPException as e:
+        # Covers rate limits, server errors, and other API failures
+        print(f"[send_dm] HTTPException sending DM to {user_id}: {e.status} {e.text}")
         return False, None, None
 
 async def create_timer_embed(team: Team):
@@ -299,6 +321,46 @@ async def create_timer_embed(team: Team):
     
     return embed
 
+async def run_network_setup(guild_id: int, team_num: int):
+    """Run the revert and start subprocesses for a team's VMID range."""
+    manager = multi_manager.get_manager(guild_id)
+    try:
+        current_dir = pathlib.Path(__file__).parent.resolve()
+    except NameError:
+        current_dir = pathlib.Path.cwd()
+
+    script_path = current_dir / "SPAM" / "status.py"
+    start_vmid = manager.settings.start_vmid + (team_num - 1) * manager.settings.number_of_machines
+    end_vmid = start_vmid + (manager.settings.number_of_machines - 1)
+
+    # Step 1: --revert
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, str(script_path),
+            "--revert", "-r",
+            str(start_vmid), str(end_vmid),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            print(f"[Guild {guild_id}] Error (revert) status.py for team {team_num}: {stderr.decode()}")
+    except Exception as e:
+        print(f"[Guild {guild_id}] Failed to start subprocess (revert) for team {team_num}: {e}")
+
+    # Step 2: -s
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, str(script_path),
+            "-s", "-r",
+            str(start_vmid), str(end_vmid),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            print(f"[Guild {guild_id}] Error (-s) status.py for team {team_num}: {stderr.decode()}")
+    except Exception as e:
+        print(f"[Guild {guild_id}] Failed to start subprocess (-s) for team {team_num}: {e}")
+
 async def end_team(guild_id: int, team_num: int, auto_end: bool = False):
     manager = multi_manager.get_manager(guild_id)
     
@@ -306,6 +368,11 @@ async def end_team(guild_id: int, team_num: int, auto_end: bool = False):
         return
     
     team = manager.teams[team_num]
+    
+    # Guard against double-fire: if already being torn down, bail out early
+    if not team.is_active:
+        return
+    
     team.is_active = False
     manager.closed_teams.add(team_num)
     
@@ -325,49 +392,10 @@ async def end_team(guild_id: int, team_num: int, auto_end: bool = False):
     for admin_id in manager.admins:
         await send_dm(admin_id, embed=embed)
 
-    # --- START: Subprocess Logic ---
-    try:
-        current_dir = pathlib.Path(__file__).parent.resolve()
-    except NameError:
-        current_dir = pathlib.Path.cwd()
-    
-    script_path = current_dir / "SPAM" / "status.py"
-    start_vmid_reset = manager.settings.start_vmid + (team_num - 1) * (manager.settings.number_of_machines)
-    end_vmid_reset = start_vmid_reset + (manager.settings.number_of_machines - 1)
-    
-    # Subprocess 1: --revert
-    try:
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, str(script_path),
-            "--revert", "-r", 
-            str(start_vmid_reset), str(end_vmid_reset),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            print(f"[Guild {guild_id}] Error (revert) status.py for team {team_num}: {stderr.decode()}")
-    except Exception as e:
-        print(f"[Guild {guild_id}] Failed to start subprocess (revert) for team {team_num}: {e}")
-
-    # Subprocess 2: -s
-    try:
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, str(script_path),
-            "-s", "-r", 
-            str(start_vmid_reset), str(end_vmid_reset),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            print(f"[Guild {guild_id}] Error (-s) status.py for team {team_num}: {stderr.decode()}")
-    except Exception as e:
-        print(f"[Guild {guild_id}] Failed to start subprocess (-s) for team {team_num}: {e}")
-    # --- END: Subprocess Logic ---
-
     manager.closed_teams.remove(team_num)
     manager.available_team_nums.add(team_num)
     del manager.teams[team_num]
-    
+
     # Save state after team ends
     manager.save_teams()
 
@@ -395,7 +423,7 @@ async def start_timer_updates():
             if not team.is_active:
                 continue
             
-            time_left = team.end_time - datetime.now()
+            time_left = team.end_time - datetime.now(timezone.utc)
             
             if time_left.total_seconds() <= 0:
                 await end_team(guild_id, team_num, auto_end=True)
@@ -427,11 +455,16 @@ async def auto_save_task():
 
 @bot.tree.command(name="admin_add", description="Administrator command to add new admins (Admin only)")
 @app_commands.describe(user="The user to make an admin")
+@app_commands.default_permissions(administrator=True)
 async def admin_add(interaction: discord.Interaction, user: discord.User):
     manager = multi_manager.get_manager(interaction.guild_id)
     
     if interaction.user.id not in manager.admins and interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+    
+    if user.id in manager.admins:
+        await interaction.response.send_message(f"{user.mention} is already an admin.", ephemeral=True)
         return
     
     manager.admins.add(user.id)
@@ -440,6 +473,7 @@ async def admin_add(interaction: discord.Interaction, user: discord.User):
 
 @bot.tree.command(name="admin_remove", description="Administrator command to remove admins (Admin only)")
 @app_commands.describe(user="The user to remove as an admin")
+@app_commands.default_permissions(administrator=True)
 async def admin_remove(interaction: discord.Interaction, user: discord.User):
     manager = multi_manager.get_manager(interaction.guild_id)
     
@@ -456,36 +490,55 @@ async def admin_remove(interaction: discord.Interaction, user: discord.User):
     await interaction.response.send_message(f"Removed {user.mention} as an admin.", ephemeral=True)
 
 @bot.tree.command(name="admin_settings", description="Configure team settings (Admin only)")
-@app_commands.describe(max_size="Max team size", max_teams="Max number of teams", duration="Duration in minutes", ip_base="IP range base (e.g., 10.10.x.10)", start_vmid="VMID of first machine cloned", number_of_machines="Number of machines per network")
-async def admin_settings(interaction: discord.Interaction, max_size: int = None, max_teams: int = None, duration: int = None, ip_base: str = None, start_vmid: int = None, number_of_machines: int = None):
+@app_commands.describe(
+    max_size="Max team size",
+    duration="Duration in minutes",
+    ip_range="IP range with bracket notation, e.g. 10.100.[41-45].0/24",
+    start_vmid="VMID of first machine cloned",
+    number_of_machines="Number of machines per network"
+)
+@app_commands.default_permissions(administrator=True)
+async def admin_settings(interaction: discord.Interaction, max_size: int = None, duration: int = None, ip_range: str = None, start_vmid: int = None, number_of_machines: int = None):
     manager = multi_manager.get_manager(interaction.guild_id)
-    
+
     if interaction.user.id not in manager.admins and interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
-    
+
     if max_size:
         manager.settings.max_team_size = max_size
-    if max_teams:
-        manager.update_max_teams(max_teams)
     if duration:
         manager.settings.duration_minutes = duration
-    if ip_base:
-        manager.settings.ip_base = ip_base
+    if ip_range is not None:
+        if not re.search(r'\[\d+-\d+\]', ip_range):
+            await interaction.response.send_message(
+                "Invalid IP range format. Use bracket notation, e.g. `10.100.[41-45].0/24`.",
+                ephemeral=True
+            )
+            return
+        manager.settings.ip_range = ip_range
+        manager.recalculate_available_teams()
     if start_vmid:
         manager.settings.start_vmid = start_vmid
     if number_of_machines:
         manager.settings.number_of_machines = number_of_machines
-    
+
     manager.save_settings()
     manager.save_teams()
-    
+
     await interaction.response.send_message(
-        f"Settings updated:\n- Max Team Size: {manager.settings.max_team_size}\n- Max Teams: {manager.settings.max_teams}\n- Duration: {manager.settings.duration_minutes} minutes\n- IP Base: {manager.settings.ip_base}\n- VMID of First Machine: {manager.settings.start_vmid}\n- Number of Machines per Network: {manager.settings.number_of_machines}",
+        f"Settings updated:"
+        f"\n- Max Team Size: {manager.settings.max_team_size}"
+        f"\n- Max Teams (derived): {manager.settings.max_teams}"
+        f"\n- Duration: {manager.settings.duration_minutes} minutes"
+        f"\n- IP Range: {manager.settings.ip_range or 'Not configured'}"
+        f"\n- VMID of First Machine: {manager.settings.start_vmid}"
+        f"\n- Number of Machines per Network: {manager.settings.number_of_machines}",
         ephemeral=True
     )
 
 @bot.tree.command(name="view_settings", description="View current team settings (Admin only)")
+@app_commands.default_permissions(administrator=True)
 async def view_settings(interaction: discord.Interaction):
     manager = multi_manager.get_manager(interaction.guild_id)
     
@@ -495,13 +548,13 @@ async def view_settings(interaction: discord.Interaction):
     
     embed = discord.Embed(title="Current Team Settings", color=discord.Color.green())
     embed.add_field(name="Max Team Size", value=str(manager.settings.max_team_size), inline=False)
-    embed.add_field(name="Max Teams", value=str(manager.settings.max_teams), inline=False)
+    embed.add_field(name="IP Range", value=manager.settings.ip_range or "Not configured", inline=False)
+    embed.add_field(name="Max Teams (derived)", value=str(manager.settings.max_teams), inline=False)
     embed.add_field(name="Duration", value=f"{manager.settings.duration_minutes} minutes", inline=False)
-    embed.add_field(name="IP Base", value=manager.settings.ip_base, inline=False)
     embed.add_field(name="Active Teams", value=str(len(manager.teams)), inline=False)
     embed.add_field(name="Available Team Numbers", value=str(len(manager.available_team_nums)), inline=False)
     embed.add_field(name="Closed Teams", value=str(sorted(manager.closed_teams)), inline=False)
-    
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 class RequestMoreTeamsView(discord.ui.View):
@@ -570,10 +623,13 @@ async def create_team(interaction: discord.Interaction):
     
     if channel_id and msg_id:
         team.timer_message_ids[user_id] = (channel_id, msg_id)
-    
+
+    # Run revert + start subprocesses now that the team has claimed its network slot
+    await run_network_setup(interaction.guild_id, team_num)
+
     # Save state after team creation
     manager.save_teams()
-    
+
     await interaction.followup.send(f"Team {team_num} created! Check your DMs for details.", ephemeral=True)
 
 class JoinRequestView(discord.ui.View):
@@ -690,6 +746,7 @@ class JoinTeamButtonView(discord.ui.View):
         await interaction.response.send_message(f"Join request sent to Team {team_num} captain! They will review your request.", ephemeral=True)
 
 @bot.tree.command(name="reset", description="Reset all teams (Admin only)")
+@app_commands.default_permissions(administrator=True)
 async def reset_teams(interaction: discord.Interaction):
     manager = multi_manager.get_manager(interaction.guild_id)
     
@@ -829,6 +886,7 @@ async def end_team_command(interaction: discord.Interaction):
 
 @bot.tree.command(name="reopen_team", description="Reopen a closed team (Admin only)")
 @app_commands.describe(team_num="The team number to reopen")
+@app_commands.default_permissions(administrator=True)
 async def reopen_team(interaction: discord.Interaction, team_num: int):
     manager = multi_manager.get_manager(interaction.guild_id)
     
@@ -849,6 +907,7 @@ async def reopen_team(interaction: discord.Interaction, team_num: int):
     await interaction.response.send_message(f"Team {team_num} has been reopened.", ephemeral=True)
 
 @bot.tree.command(name="save_data", description="Manually save all data (Admin only)")
+@app_commands.default_permissions(administrator=True)
 async def save_data(interaction: discord.Interaction):
     manager = multi_manager.get_manager(interaction.guild_id)
     
@@ -865,6 +924,7 @@ async def save_data(interaction: discord.Interaction):
     await interaction.followup.send("All data has been saved successfully!", ephemeral=True)
 
 @bot.tree.command(name="toggle_bot", description="Toggle the bot on or off for this server (Admin only)")
+@app_commands.default_permissions(administrator=True)
 async def toggle_bot(interaction: discord.Interaction):
     manager = multi_manager.get_manager(interaction.guild_id)
 
