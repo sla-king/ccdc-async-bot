@@ -21,12 +21,23 @@ intents.dm_messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-async def block_dms_globally(interaction: discord.Interaction):
+async def global_interaction_check(interaction: discord.Interaction):
+    # Block DMs
     if interaction.guild is None:
         await interaction.response.send_message("This command can only be used inside a server channel.", ephemeral=True)
         return False
+
+    if interaction.command and interaction.command.name == "toggle_bot":
+        return True
+
+    manager = multi_manager.get_manager(interaction.guild_id)
+    if not manager.settings.bot_enabled:
+        await interaction.response.send_message("The bot is currently **OFF**. Please wait until an admin turns it back on.", ephemeral=True)
+        return False
+
     return True
-bot.tree.interaction_check = block_dms_globally
+
+bot.tree.interaction_check = global_interaction_check
 
 # Base directory for all bot data
 DATA_DIR = pathlib.Path("bot_data")
@@ -45,6 +56,7 @@ class TeamSettings:
         self.ip_base = "10.10.x.10"
         self.start_vmid = 0
         self.number_of_machines = 0
+        self.bot_enabled = True
     
     def get_ip(self, team_num: int) -> str:
         return self.ip_base.replace("x", str(team_num))
@@ -56,7 +68,8 @@ class TeamSettings:
             "duration_minutes": self.duration_minutes,
             "ip_base": self.ip_base,
             "start_vmid": self.start_vmid,
-            "number_of_machines": self.number_of_machines
+            "number_of_machines": self.number_of_machines,
+            "bot_enabled": self.bot_enabled
         }
     
     @classmethod
@@ -68,6 +81,7 @@ class TeamSettings:
         settings.ip_base = data.get("ip_base", "10.10.x.10")
         settings.start_vmid = data.get("start_vmid", 0)
         settings.number_of_machines = data.get("number_of_machines", 0)
+        settings.bot_enabled = data.get("bot_enabled", True)
         return settings
 
 class Team:
@@ -849,6 +863,20 @@ async def save_data(interaction: discord.Interaction):
     manager.save_teams()
     
     await interaction.followup.send("All data has been saved successfully!", ephemeral=True)
+
+@bot.tree.command(name="toggle_bot", description="Toggle the bot on or off for this server (Admin only)")
+async def toggle_bot(interaction: discord.Interaction):
+    manager = multi_manager.get_manager(interaction.guild_id)
+
+    if interaction.user.id not in manager.admins and interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    manager.settings.bot_enabled = not manager.settings.bot_enabled
+    manager.save_settings()
+
+    status = "**ON**" if manager.settings.bot_enabled else "**OFF**"
+    await interaction.response.send_message(f"The bot is now {status} for this server.", ephemeral=True)
 
 # Run the bot
 bot.run(token)
