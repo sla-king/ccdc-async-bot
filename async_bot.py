@@ -361,6 +361,31 @@ async def run_network_setup(guild_id: int, team_num: int):
     except Exception as e:
         print(f"[Guild {guild_id}] Failed to start subprocess (-s) for team {team_num}: {e}")
 
+async def run_network_teardown(guild_id: int, team_num: int):
+    """Stop the VMs for a team's VMID range when the team ends."""
+    manager = multi_manager.get_manager(guild_id)
+    try:
+        current_dir = pathlib.Path(__file__).parent.resolve()
+    except NameError:
+        current_dir = pathlib.Path.cwd()
+
+    script_path = current_dir / "SPAM" / "status.py"
+    start_vmid = manager.settings.start_vmid + (team_num - 1) * manager.settings.number_of_machines
+    end_vmid = start_vmid + (manager.settings.number_of_machines - 1)
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, str(script_path),
+            "--stop", "-r",  # Change "--stop" if status.py uses a different flag (e.g. "-k" or "--shutdown")
+            str(start_vmid), str(end_vmid),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            print(f"[Guild {guild_id}] Error (stop) status.py for team {team_num}: {stderr.decode()}")
+    except Exception as e:
+        print(f"[Guild {guild_id}] Failed to start subprocess (stop) for team {team_num}: {e}")
+
 async def end_team(guild_id: int, team_num: int, auto_end: bool = False):
     manager = multi_manager.get_manager(guild_id)
     
@@ -391,6 +416,9 @@ async def end_team(guild_id: int, team_num: int, auto_end: bool = False):
     
     for admin_id in manager.admins:
         await send_dm(admin_id, embed=embed)
+
+    # Stop the team's VMs before releasing the team number back to the pool
+    await run_network_teardown(guild_id, team_num)
 
     manager.closed_teams.remove(team_num)
     manager.available_team_nums.add(team_num)
@@ -776,8 +804,9 @@ async def reset_teams(interaction: discord.Interaction):
     
     await interaction.response.defer(ephemeral=True)
     
-    # Notify all team members that their teams are being reset
+    # Notify all team members that their teams are being reset and stop their VMs
     for team_num, team in list(manager.teams.items()):
+        team.is_active = False
         reset_embed = discord.Embed(
             title=f"Team {team_num} - Reset",
             description="All teams have been reset by an administrator.",
@@ -787,6 +816,8 @@ async def reset_teams(interaction: discord.Interaction):
             await send_dm(member_id, embed=reset_embed)
             if member_id in manager.user_teams:
                 del manager.user_teams[member_id]
+        
+        await run_network_teardown(interaction.guild_id, team_num)
     
     # Clear all teams and reopen them
     manager.teams.clear()
