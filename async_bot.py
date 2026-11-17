@@ -322,7 +322,7 @@ async def create_timer_embed(team: Team):
     return embed
 
 async def run_network_setup(guild_id: int, team_num: int):
-    """Run the revert and start subprocesses for a team's VMID range."""
+    """Run the start subprocess for a team's VMID range."""
     manager = multi_manager.get_manager(guild_id)
     try:
         current_dir = pathlib.Path(__file__).parent.resolve()
@@ -333,21 +333,7 @@ async def run_network_setup(guild_id: int, team_num: int):
     start_vmid = manager.settings.start_vmid + (team_num - 1) * manager.settings.number_of_machines
     end_vmid = start_vmid + (manager.settings.number_of_machines - 1)
 
-    # Step 1: --revert
-    try:
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, str(script_path),
-            "--revert", "-r",
-            str(start_vmid), str(end_vmid),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            print(f"[Guild {guild_id}] Error (revert) status.py for team {team_num}: {stderr.decode()}")
-    except Exception as e:
-        print(f"[Guild {guild_id}] Failed to start subprocess (revert) for team {team_num}: {e}")
-
-    # Step 2: -s
+    # Start VMs (-s)
     try:
         process = await asyncio.create_subprocess_exec(
             sys.executable, str(script_path),
@@ -362,7 +348,7 @@ async def run_network_setup(guild_id: int, team_num: int):
         print(f"[Guild {guild_id}] Failed to start subprocess (-s) for team {team_num}: {e}")
 
 async def run_network_teardown(guild_id: int, team_num: int):
-    """Stop the VMs for a team's VMID range when the team ends."""
+    """Stop and revert the VMs for a team's VMID range when the team ends."""
     manager = multi_manager.get_manager(guild_id)
     try:
         current_dir = pathlib.Path(__file__).parent.resolve()
@@ -373,10 +359,11 @@ async def run_network_teardown(guild_id: int, team_num: int):
     start_vmid = manager.settings.start_vmid + (team_num - 1) * manager.settings.number_of_machines
     end_vmid = start_vmid + (manager.settings.number_of_machines - 1)
 
+    # Step 1: Stop VMs (--stop)
     try:
         process = await asyncio.create_subprocess_exec(
             sys.executable, str(script_path),
-            "--stop", "-r",  # Change "--stop" if status.py uses a different flag (e.g. "-k" or "--shutdown")
+            "--stop", "-r",
             str(start_vmid), str(end_vmid),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
@@ -385,6 +372,20 @@ async def run_network_teardown(guild_id: int, team_num: int):
             print(f"[Guild {guild_id}] Error (stop) status.py for team {team_num}: {stderr.decode()}")
     except Exception as e:
         print(f"[Guild {guild_id}] Failed to start subprocess (stop) for team {team_num}: {e}")
+
+    # Step 2: Revert VMs (--revert)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, str(script_path),
+            "--revert", "-r",
+            str(start_vmid), str(end_vmid),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            print(f"[Guild {guild_id}] Error (revert) status.py for team {team_num}: {stderr.decode()}")
+    except Exception as e:
+        print(f"[Guild {guild_id}] Failed to start subprocess (revert) for team {team_num}: {e}")
 
 async def end_team(guild_id: int, team_num: int, auto_end: bool = False):
     manager = multi_manager.get_manager(guild_id)
@@ -823,8 +824,11 @@ async def reset_teams(interaction: discord.Interaction):
         return
     
     await interaction.response.defer(ephemeral=True)
+    await interaction.edit_original_response(
+        content="Stopping and reverting machines for all active teams, please wait..."
+    )
     
-    # Notify all team members that their teams are being reset and stop their VMs
+    # Notify all team members that their teams are being reset and stop/revert their VMs
     for team_num, team in list(manager.teams.items()):
         team.is_active = False
         reset_embed = discord.Embed(
@@ -847,7 +851,9 @@ async def reset_teams(interaction: discord.Interaction):
     # Save state after reset
     manager.save_teams()
     
-    await interaction.followup.send("All teams have been reset and reopened!", ephemeral=True)
+    await interaction.edit_original_response(
+        content="All teams have been reset, machines stopped and reverted, and team slots reopened."
+    )
 
 @bot.tree.command(name="join_team", description="Join an existing team")
 async def join_team(interaction: discord.Interaction):
@@ -916,7 +922,13 @@ async def leave_team(interaction: discord.Interaction):
     await send_dm(user_id, embed=leave_embed)
     
     if not team.members:
+        await interaction.edit_original_response(
+            content=f"Left Team {team_num}. Stopping and reverting machines for Team {team_num}, please wait..."
+        )
         await end_team(interaction.guild_id, team_num)
+        await interaction.edit_original_response(
+            content=f"Left Team {team_num}. Team {team_num} has ended and its machines have been stopped and reverted."
+        )
     else:
         if user_id == team.captain_id:
             team.captain_id = list(team.members.keys())[0]
@@ -937,8 +949,7 @@ async def leave_team(interaction: discord.Interaction):
         
         # Save state after member leaves
         manager.save_teams()
-    
-    await interaction.followup.send(f"Left Team {team_num}.", ephemeral=True)
+        await interaction.followup.send(f"Left Team {team_num}.", ephemeral=True)
 
 @bot.tree.command(name="end_team", description="End your team as captain")
 async def end_team_command(interaction: discord.Interaction):
@@ -958,8 +969,13 @@ async def end_team_command(interaction: discord.Interaction):
         await interaction.followup.send("Only the team captain can end the team!", ephemeral=True)
         return
     
+    await interaction.edit_original_response(
+        content=f"Stopping and reverting machines for Team {team_num}, please wait..."
+    )
     await end_team(interaction.guild_id, team_num)
-    await interaction.followup.send(f"Team {team_num} has been ended.", ephemeral=True)
+    await interaction.edit_original_response(
+        content=f"Team {team_num} has been ended, and its machines have been stopped and reverted."
+    )
 
 @bot.tree.command(name="reopen_team", description="Reopen a closed team (Admin only)")
 @app_commands.describe(team_num="The team number to reopen")
