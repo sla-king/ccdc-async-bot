@@ -413,9 +413,6 @@ async def end_team(guild_id: int, team_num: int, auto_end: bool = False):
         await send_dm(member_id, embed=embed)
         if member_id in manager.user_teams:
             del manager.user_teams[member_id]
-    
-    for admin_id in manager.admins:
-        await send_dm(admin_id, embed=embed)
 
     # Stop the team's VMs before releasing the team number back to the pool
     await run_network_teardown(guild_id, team_num)
@@ -467,9 +464,6 @@ async def start_timer_updates():
                 )
                 for member_id in team.members.keys():
                     await send_dm(member_id, embed=halfway_embed)
-                
-                for admin_id in manager.admins:
-                    await send_dm(admin_id, embed=halfway_embed)
                 
                 # Save state after halfway notification
                 manager.save_teams()
@@ -662,6 +656,15 @@ async def create_team(interaction: discord.Interaction):
     # Save state after team creation
     manager.save_teams()
 
+    admin_start_embed = discord.Embed(
+        title=f"Team {team_num} - Started",
+        description=f"**Started by:** {interaction.user.mention} (`{interaction.user.name}`)",
+        color=discord.Color.green()
+    )
+    admin_start_embed.add_field(name="IP Range", value=team.settings.get_ip(team_num), inline=False)
+    for admin_id in manager.admins:
+        await send_dm(admin_id, embed=admin_start_embed)
+
     await interaction.edit_original_response(content=f"Team {team_num} is ready! Check your DMs for details.")
 
 class JoinRequestView(discord.ui.View):
@@ -718,7 +721,24 @@ class JoinRequestView(discord.ui.View):
         
         # Save state after member joins
         manager.save_teams()
-        
+
+        # Notify admins who joined the team
+        admin_join_embed = discord.Embed(
+            title=f"Team {self.team_num} - Member Joined",
+            description=(
+                f"**Joined:** <@{self.user_id}> (`{self.username}`)\n"
+                f"**Approved by Captain:** {interaction.user.mention} (`{interaction.user.name}`)"
+            ),
+            color=discord.Color.blue()
+        )
+        admin_join_embed.add_field(
+            name=f"Team Members ({len(team.members)}/{manager.settings.max_team_size})",
+            value=", ".join(team.members.values()),
+            inline=False
+        )
+        for admin_id in manager.admins:
+            await send_dm(admin_id, embed=admin_join_embed)
+                
         await interaction.followup.send(f"Approved {self.username} to join Team {self.team_num}!", ephemeral=True)
     
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
