@@ -646,15 +646,24 @@ class JoinRequestView(discord.ui.View):
     
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         manager = multi_manager.get_manager(self.guild_id)
         
-        if interaction.user.id != manager.teams[self.team_num].captain_id:
-            await interaction.response.send_message("Only the team captain can approve join requests.", ephemeral=True)
+        if self.team_num not in manager.teams:
+            await interaction.followup.send("That team no longer exists.", ephemeral=True)
+            return
+
+        team = manager.teams[self.team_num]
+        if interaction.user.id != team.captain_id:
+            await interaction.followup.send("Only the team captain can approve join requests.", ephemeral=True)
             return
         
-        team = manager.teams[self.team_num]
+        if self.user_id in manager.user_teams:
+            await interaction.followup.send(f"{self.username} is already in a team.", ephemeral=True)
+            return
+
         if len(team.members) >= manager.settings.max_team_size:
-            await interaction.response.send_message("That team is now full!", ephemeral=True)
+            await interaction.followup.send("That team is now full!", ephemeral=True)
             return
         
         team.members[self.user_id] = self.username
@@ -664,9 +673,9 @@ class JoinRequestView(discord.ui.View):
         dm_sent, channel_id, msg_id = await send_dm(self.user_id, embed=timer_embed)
         
         if not dm_sent:
-            await interaction.response.send_message("Couldn't send DM to user. They may have DMs disabled.", ephemeral=True)
             del team.members[self.user_id]
             del manager.user_teams[self.user_id]
+            await interaction.followup.send("Couldn't send DM to user. They may have DMs disabled.", ephemeral=True)
             return
         
         if channel_id and msg_id:
@@ -682,14 +691,19 @@ class JoinRequestView(discord.ui.View):
         # Save state after member joins
         manager.save_teams()
         
-        await interaction.response.send_message(f"Approved {self.username} to join Team {self.team_num}!", ephemeral=True)
+        await interaction.followup.send(f"Approved {self.username} to join Team {self.team_num}!", ephemeral=True)
     
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
     async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         manager = multi_manager.get_manager(self.guild_id)
         
+        if self.team_num not in manager.teams:
+            await interaction.followup.send("That team no longer exists.", ephemeral=True)
+            return
+
         if interaction.user.id != manager.teams[self.team_num].captain_id:
-            await interaction.response.send_message("Only the team captain can deny join requests.", ephemeral=True)
+            await interaction.followup.send("Only the team captain can deny join requests.", ephemeral=True)
             return
         
         denied_embed = discord.Embed(
@@ -699,7 +713,8 @@ class JoinRequestView(discord.ui.View):
         )
         await send_dm(self.user_id, embed=denied_embed)
         
-        await interaction.response.send_message(f"Denied {self.username}'s join request.", ephemeral=True)
+        await interaction.followup.send(f"Denied {self.username}'s join request.", ephemeral=True)
+
 
 class JoinTeamButtonView(discord.ui.View):
     def __init__(self, user_id: int, username: str, guild_id: int):
@@ -721,15 +736,16 @@ class JoinTeamButtonView(discord.ui.View):
                 self.add_item(button)
     
     async def join_callback(self, interaction: discord.Interaction, team_num: int):
+        await interaction.response.defer(ephemeral=True)
         manager = multi_manager.get_manager(self.guild_id)
         
         if team_num not in manager.teams:
-            await interaction.response.send_message("That team no longer exists.", ephemeral=True)
+            await interaction.followup.send("That team no longer exists.", ephemeral=True)
             return
         
         team = manager.teams[team_num]
         if len(team.members) >= manager.settings.max_team_size:
-            await interaction.response.send_message("That team is now full!", ephemeral=True)
+            await interaction.followup.send("That team is now full!", ephemeral=True)
             return
         
         request_view = JoinRequestView(self.user_id, self.username, team_num, self.guild_id)
@@ -744,10 +760,10 @@ class JoinTeamButtonView(discord.ui.View):
         captain_dm_sent, _, _ = await send_dm(team.captain_id, embed=request_embed, view=request_view)
         
         if not captain_dm_sent:
-            await interaction.response.send_message("Couldn't send join request to captain. Captain may have DMs disabled.", ephemeral=True)
+            await interaction.followup.send("Couldn't send join request to captain. Captain may have DMs disabled.", ephemeral=True)
             return
         
-        await interaction.response.send_message(f"Join request sent to Team {team_num} captain! They will review your request.", ephemeral=True)
+        await interaction.followup.send(f"Join request sent to Team {team_num} captain! They will review your request.", ephemeral=True)
 
 @bot.tree.command(name="reset", description="Reset all teams (Admin only)")
 @app_commands.default_permissions(administrator=True)
@@ -805,13 +821,19 @@ async def join_team(interaction: discord.Interaction):
         return
     
     info_embed = discord.Embed(title="Available Teams", color=discord.Color.blue())
+    now = datetime.now(timezone.utc)
     for team_num, team in sorted(manager.teams.items()):
         if len(team.members) < manager.settings.max_team_size and team.is_active:
-            time_left = team.end_time - datetime.now()
-            mins, secs = divmod(int(time_left.total_seconds()), 60)
+            time_left = team.end_time - now
+            remaining_seconds = max(0, int(time_left.total_seconds()))
+            mins, secs = divmod(remaining_seconds, 60)
             info_embed.add_field(
                 name=f"Team {team_num}",
-                value=f"**Members:** {len(team.members)}/{manager.settings.max_team_size}\n**Time Left:** {mins}m {secs}s\n**Members:** {', '.join(list(team.members.values())[:3])}{'...' if len(team.members) > 3 else ''}",
+                value=(
+                    f"**Members:** {len(team.members)}/{manager.settings.max_team_size}\n"
+                    f"**Time Left:** {mins}m {secs}s\n"
+                    f"**Members:** {', '.join(list(team.members.values())[:3])}{'...' if len(team.members) > 3 else ''}"
+                ),
                 inline=False
             )
     
